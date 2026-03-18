@@ -1,0 +1,234 @@
+name: 🎲 Criando o BD em produção
+
+on:
+  workflow_call:
+    inputs:
+      project:
+        required: true
+        type: string
+      folder:
+        required: true
+        type: string
+
+jobs:
+  deploy-bd:
+    name: ⚙️ Construindo tudo para colocar para produção...
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      PROJETO: ${{ inputs.project }}
+      # FOLDER: ${{ inputs.folder }}      
+      DEPLOY_ENV: "projetos/${{ inputs.project }}/${{ inputs.folder }}/.deploy.env"
+      PATH_K8S: "k8s/bd"
+    steps:
+      - uses: actions/checkout@v5.0.0
+        with: 
+          fetch-depth: 0
+
+      - name: 📁 Criando diretório temporário para trabalho 
+        id: work-dir
+        run: |
+          WORK_DIR="temp_repo_$(date +%s)"
+          mkdir "$WORK_DIR"
+
+          echo "WORK_DIR=$WORK_DIR" >> $GITHUB_OUTPUT
+
+          # Copiando arquivos de trabalho
+          cp $PATH_K8S/* $WORK_DIR
+
+          # nome do secret do BD:
+          # Extraindo o nome do Secret no formato @NOME_SEGREDO@
+          secret_env=$(grep -oPm1 '@\K[^@]+(?=@)' "$DEPLOY_ENV")
+
+          echo "SECRET_NAME=$secret_env" >> $GITHUB_ENV
+
+
+
+      - name: 🔩 Modificando o Secret e ConfigMap
+        id: secret-e-configmap
+        env:
+          WORK_DIR: ${{ steps.work-dir.outputs.WORK_DIR }}
+        run: |
+          # Alterando alguns dados comuns nos arquivos bd-secret.yaml e bd-configmap.yaml
+          echo "Alterando o nome do projeto no Secret e ConfigMap"
+          sed -i "s|^    projeto: nomeProjeto # Alterar|    projeto: ${PROJETO}|" "$WORK_DIR/bd-secret.yaml"
+          sed -i "s|^    projeto: nomeProjeto # Alterar|    projeto: ${PROJETO}|" "$WORK_DIR/bd-configmap.yaml"
+
+
+          echo "Alterando os nomes de cada arquivo"
+          # substituindo o underline "_" pelo hífen "-" na criação do nome dos secretes e configs...
+          PROJETO_NEW_NAME="${NOME_PROJETO//_/-}"
+          nome_secret="bd-secret-${PROJETO_NEW_NAME}"
+          nome_config="bd-config-${PROJETO_NEW_NAME}"
+
+          # nome_secret_e_configmap="bd-${PROJETO}"
+          
+          sed -i "s|^  name: mySecret # Alterar|  name: ${nome_secret}|" "$WORK_DIR/bd-secret.yaml"
+          sed -i "s|^  name: myconfigMap # Alterar|  name: ${nome_config}|" "$WORK_DIR/bd-configmap.yaml"
+          
+          echo "nome_secret=$nome_secret" >> $GITHUB_OUTPUT
+          echo "nome_config=$nome_config" >> $GITHUB_OUTPUT
+          
+          # echo "nome_secret_e_configmap=$nome_secret_e_configmap" >> $GITHUB_OUTPUT
+
+          # removendo linhas desnecessárias:
+          sed -i "/^  key: value/d" "$WORK_DIR/bd-secret.yaml"
+          sed -i "/^  key: value/d" "$WORK_DIR/bd-configmap.yaml"
+          
+          # Lendo o arquivo de ENVs para modificar os arquivos:
+          while IFS=$'\n' read -r line; do
+            # if [[ -n "$line" && "$line" != \#* ]]; then
+
+            if [[ "$line" =~ [^[:space:]] && "$line" != \#* ]]; then
+              IFS='=' read -r key value <<< "$line"
+                if [ "$value" = "@${{ env.SECRET_NAME }}@" ]; then
+                  valor_codificado2="$(echo -n ${{ secrets[env.SECRET_NAME] }} | base64 | sed 's/./& /g' )"
+                  echo "  ${key}: $(echo $valor_codificado2 | tr -d ' ')" >> "$WORK_DIR/bd-secret.yaml"
+                else                    
+
+                  # Adicionando dados no arquivo de ConfigMap:
+                  echo "  ${key}: '${value}'" >> "$WORK_DIR/bd-configmap.yaml"    
+                  echo "${key}=${value}" >> $GITHUB_OUTPUT
+
+                fi
+            fi
+          done < $DEPLOY_ENV
+
+
+
+      - name: 🔩 Modificando o PVC
+        id: pvc
+        env:
+          WORK_DIR: ${{ steps.work-dir.outputs.WORK_DIR }}
+        run: |
+          echo "Alterando o nome do PVC"
+          nome_pvc="pvc-${PROJETO}"
+          
+          sed -i "s|^  name: mypvc # Alterar|  name: ${nome_pvc}|" "$WORK_DIR/pvc.yaml"
+          sed -i "s|^    projeto: nomeProjeto # Alterar|    projeto: ${PROJETO}|" "$WORK_DIR/pvc.yaml"
+          
+
+          echo "nome_pvc=$nome_pvc" >> $GITHUB_OUTPUT
+
+
+
+      - name: 🔩 Modificando os Services
+        id: services
+        env:
+          WORK_DIR: ${{ steps.work-dir.outputs.WORK_DIR }}
+          PORT: ${{ steps.secret-e-configmap.outputs.DATABASE_PORT }}
+        run: |
+          # Alterando dados em comuns nos Services service-interno.yaml e service-externo.yaml
+          echo "Alterando dados dos Services"
+          sed -i "s|^    projeto: nomeProjeto # Alterar|    projeto: ${PROJETO}|" "$WORK_DIR/service-interno.yaml"
+          sed -i "s|^    projeto: nomeProjeto # Alterar|    projeto: ${PROJETO}|" "$WORK_DIR/service-externo.yaml"
+
+
+          # Alterando nomes de cada service
+          sed -i "s|^  name: service-projeto # Alterar|  name: service-${PROJETO}|" "$WORK_DIR/service-interno.yaml"
+          sed -i "s|^  name: service-projeto-externo # Alterar|  name: service-${PROJETO}-externo|" "$WORK_DIR/service-externo.yaml"
+
+
+          # Definindo o nome do app (name do Replicaset do StatefulSet)
+          app_name="app-bd-${PROJETO}"
+          echo "app_name=$app_name" >> $GITHUB_OUTPUT
+
+          sed -i "s|^    app: myapp # Alterar - nome dos pods que o ReplicaSet vai ficar cuidando|    app: ${app_name}|" "$WORK_DIR/service-interno.yaml"
+          sed -i "s|^    app: myapp # Alterar - nome dos pods que o ReplicaSet vai ficar cuidando|    app: ${app_name}|" "$WORK_DIR/service-externo.yaml"
+
+          # Alterando as Portas
+          sed -i "s|^    - port: DATABASE_PORT #Alterar - mesmo dado pelo .deploy.env|    - port: ${PORT}|" "$WORK_DIR/service-interno.yaml"
+          sed -i "s|^    - port: DATABASE_PORT #Alterar - mesmo dado pelo .deploy.env|    - port: ${PORT}|" "$WORK_DIR/service-externo.yaml"
+          sed -i "s|^      targetPort: DATABASE_PORT #Alterar - mesmo dado pelo .deploy.env|      targetPort: ${PORT}|" "$WORK_DIR/service-externo.yaml"
+
+
+
+
+      - name: 🔩 Modificando o StatefulSet
+        id: statefulset
+        env:
+          WORK_DIR: ${{ steps.work-dir.outputs.WORK_DIR }}
+          APP_NAME: ${{ steps.services.outputs.app_name }}
+          PORT: ${{ steps.secret-e-configmap.outputs.DATABASE_PORT }}
+          MOUNT_PATH: ${{ steps.secret-e-configmap.outputs.DATABASE_VOLUME }}
+          PVC_NAME: ${{ steps.pvc.outputs.nome_pvc }}
+          IMAGE_DATABASE: ${{ steps.secret-e-configmap.outputs.IMAGE_DOCKER_DATABASE }}
+          SECRET_NAME: ${{ steps.secret-e-configmap.outputs.nome_secret }}
+          CONFIGMAP_NAME: ${{ steps.secret-e-configmap.outputs.nome_config }}
+        run: |
+          echo "Alterando o nome do StatefulSet"
+          sed -i "s|^  name: mystatefulset # Alterar|  name: bd-${PROJETO}|" "$WORK_DIR/statefulset.yaml"
+
+
+          # Alterando o nome do label > metadata.labels.projeto
+          sed -i "s|^    projeto: nomeProjeto # Alterar|    projeto: ${PROJETO}|" "$WORK_DIR/statefulset.yaml"
+
+
+          # Alterando o nome do serviceName > spec.serviceName
+          sed -i "s|^  serviceName: bd-projeto # Alterar|  serviceName: bd-${PROJETO}|" "$WORK_DIR/statefulset.yaml"
+
+          # Alterando os matchLabels > spec.selector.matchlabels.app
+          sed -i "s|^      app: myapp # Alterar - nome dos pods que o ReplicaSet vai ficar cuidando|      app: ${APP_NAME}|" "$WORK_DIR/statefulset.yaml"
+          
+          # Alterando o nome da labels > spec.template.metadata.labels.app
+          sed -i "s|^        app: myapp # Alterar - nome dos pods|        app: ${APP_NAME}|" "$WORK_DIR/statefulset.yaml"
+
+
+          # Alterando a label de projeto > spec.template.metadata.labels.projeto
+          sed -i "s|^        projeto: nomeProjeto # Alterar - template|        projeto: ${PROJETO}|" "$WORK_DIR/statefulset.yaml"
+
+
+          # Alterando o nome do PVC em volume > spec.template.spec.volumes.name e spec.template.spec.volumes.name.persistentVolumeClaim.claimName
+          sed -i "s|^        - name: mypvc # Alterar - mesmo nome em pvc.yaml|        - name: ${PVC_NAME}|" "$WORK_DIR/statefulset.yaml"
+          sed -i "s|^            claimName: mypvc # Alterar - mesmo nome em pvc.yaml|            claimName: ${PVC_NAME}|" "$WORK_DIR/statefulset.yaml"
+          
+
+          # Alterando o nome dos Containers > spec.template.spec.volumes.containers.name
+          sed -i "s|^        - name: bd-projeto # alterar|        - name: database-${PROJETO}|" "$WORK_DIR/statefulset.yaml"
+
+          # Alterando a imagem docker do BD > spec.template.spec.volumes.containers.image
+          sed -i "s|^          image: IMAGE_DOCKER_DATABASE # alterar, pegar do .deploy.env|          image: ${IMAGE_DATABASE}|" "$WORK_DIR/statefulset.yaml"
+
+
+          # Alterando o containerPort > spec.template.spec.volumes.containers.ports.containerPort
+          sed -i "s|^            - containerPort: DATABASE_PORT #Alterar - mesmo dado pelo .deploy.env|            - containerPort: ${PORT}|" "$WORK_DIR/statefulset.yaml"
+          
+          
+          # Alterar os nomes do Configmap e Secret > spec.template.spec.volumes.containers.envFrom.configMapRef.name e spec.template.spec.volumes.containers.envFrom.secretRef.name
+          sed -i "s|^                name: myconfigMap # Alterar - mesmo nome em bd-configmap.yaml|                name: ${CONFIGMAP_NAME}|" "$WORK_DIR/statefulset.yaml"
+          sed -i "s|^                name: mySecret # Alterar - mesmo nome em bd-secret.yaml|                name: ${SECRET_NAME}|" "$WORK_DIR/statefulset.yaml"
+
+
+          # Alterando o VolumeMounts > spec.template.spec.volumes.containers.volumeMounts.name e spec.template.spec.volumes.containers.volumeMounts.mountPath
+          sed -i "s|^          - name: mypvc # Alterar volumeMounts - mesmo nome em pvc.yaml|          - name: ${PVC_NAME}|" "$WORK_DIR/statefulset.yaml"
+          sed -i "s|^            mountPath: DATABASE_VOLUME # Alterar - mesmo dado pelo .deploy.env|            mountPath: ${MOUNT_PATH}|" "$WORK_DIR/statefulset.yaml"
+
+
+
+      - name: ⚒️ Acessando RNP e Aplicando manifestos no ambiente Kubernetes
+        env:
+          WORK_DIR: ${{ steps.work-dir.outputs.WORK_DIR }}
+          SSH_KEY: ${{ secrets.SSH_KEY_RNP }} 
+          USER: ${{ secrets.SSH_USER_RNP }}
+          HOST: ${{ secrets.SSH_HOST_RNP }}
+          PORTA: 2200
+        run: |
+          echo "${SSH_KEY}" > ssh_rnp_actions
+          chmod 400 ssh_rnp_actions
+
+          mv $WORK_DIR temp_manifests
+
+          cat temp_manifests/bd-configmap.yaml
+          cat temp_manifests/bd-secret.yaml
+          cat temp_manifests/statefulset.yaml
+
+          tar czf - temp_manifests/ | ssh -o StrictHostKeyChecking=no $USER@$HOST -p $PORTA -i ./ssh_rnp_actions -t '\
+            tar xzf - && \
+            kubectl apply -f temp_manifests/bd-secret.yaml  && \
+            kubectl apply -f temp_manifests/bd-configmap.yaml  && \
+            kubectl apply -f temp_manifests/pvc.yaml  && \
+            kubectl apply -f temp_manifests/statefulset.yaml  && \
+            kubectl apply -f temp_manifests/  && \
+            sleep 5 ; rm -rf temp_manifests/  '
+
