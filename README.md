@@ -1,1 +1,2 @@
 # VIGIA_BD
+O VIGIA_BD é um projeto de banco de dados desenvolvido em PostgreSQL com o objetivo de garantir controle, rastreabilidade e gestão eficiente da frota de veículos da Polícia Civil. A plataforma foi projetada para centralizar informações estratégicas sobre veículos, agentes responsáveis, manutenções, deslocamentos e histórico operacional, proporcionando maior transparência, segurança e eficiência na administração da frota policial.
